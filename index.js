@@ -57,8 +57,39 @@ app.get('/api/auth/me', async (req, res) => {
 });
 
 // API Routes
+app.get('/api/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    activeConnections: io.engine.clientsCount
+  });
+});
+
+// API Routes
 app.use('/api/users', userRouter);
 app.use('/api/games', gameRouter);
+
+// Diagnostic endpoint - check room state
+app.get('/api/debug/rooms', (req, res) => {
+  const roomInfo = Object.keys(rooms).map(roomId => ({
+    roomId,
+    players: rooms[roomId].map(p => ({ socketId: p.socketId, userId: p.userId, color: p.color }))
+  }));
+  res.json({ totalRooms: Object.keys(rooms).length, rooms: roomInfo, connectedClients: io.engine.clientsCount });
+});
+
+// Diagnostic endpoint - check game state
+app.get('/api/debug/game/:gameId', async (req, res) => {
+  try {
+    const game = await Game.findById(req.params.gameId);
+    if (!game) return res.status(404).json({ error: "Game not found" });
+    res.json(game);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.post('/api/commentary', async (req, res) => {
   try {
     const { mode, move, fen, lastMoves, isUserMove } = req.body.prompt;
@@ -83,6 +114,17 @@ const io = new Server(http, {
     ],
     credentials: true,
     methods: ['GET', 'POST']
+  },
+  transports: ['websocket', 'polling'],
+  secure: true,
+  rejectUnauthorized: false,
+  allowEIO3: true,
+  pingInterval: 25000,
+  pingTimeout: 60000,
+  upgradeTimeout: 10000,
+  maxHttpBufferSize: 1e6,
+  perMessageDeflate: {
+    threshold: 1024 * 64
   }
 });
 
@@ -101,12 +143,15 @@ io.on('connection', (socket) => {
         return;
       }
 
-      if (!rooms[roomId]) rooms[roomId] = [];
+      if (!rooms[roomId]) {
+        console.log(`[JOIN] Creating new room: ${roomId}`);
+        rooms[roomId] = [];
+      }
 
       // Check if user is already in the room
       const isAlreadyJoined = rooms[roomId].some(player => player.userId === userId);
       if (isAlreadyJoined) {
-        console.log(`User ${userId} is already in room ${roomId}`);
+        console.log(`[JOIN] User ${userId} already in room ${roomId}`);
         socket.emit("errorMessage", "You are already in this room.");
         return;
       }
@@ -116,7 +161,7 @@ io.on('connection', (socket) => {
 
       // Check if room is full
       if (players.length >= 2) {
-        console.log(`Room ${roomId} is full`);
+        console.log(`[JOIN] Room ${roomId} is full`);
         socket.emit("errorMessage", "Room is full.");
         return;
       }
@@ -130,7 +175,7 @@ io.on('connection', (socket) => {
       }
 
       if (takenColors.includes(color)) {
-        console.log(`Color ${color} already taken in room ${roomId}`);
+        console.log(`[JOIN] Color ${color} already taken in room ${roomId}`);
         socket.emit("errorMessage", `Color ${color} already taken.`);
         return;
       }
@@ -142,7 +187,7 @@ io.on('connection', (socket) => {
       socket.data.roomId = roomId;
       socket.data.userId = userId;
 
-      console.log(`User ${userId} (socket ${socket.id}) joined room ${roomId} as ${color}`);
+      console.log(`[JOIN] User ${userId} (socket ${socket.id}) joined room ${roomId} as ${color}. Room now has ${rooms[roomId].length} players.`);
 
       socket.emit("assignedColor", color);
       socket.to(roomId).emit("playerJoined", { message: `${userId} joined as ${color}` });
@@ -172,7 +217,7 @@ io.on('connection', (socket) => {
         const blackPlayer = rooms[roomId].find(p => p.color === 'black');
 
         if (!whitePlayer || !blackPlayer) {
-          console.error("Error: Could not find both players after room join");
+          console.error("[JOIN] Error: Could not find both players after room join");
           socket.emit("errorMessage", "Error setting up game.");
           return;
         }
@@ -197,9 +242,9 @@ io.on('connection', (socket) => {
             turn: 'white',
             lastMoveTimestamp: Date.now()
           });
-          console.log(`Created new game ${game._id} for room ${roomId}`);
+          console.log(`[JOIN] Created new game ${game._id} for room ${roomId}`);
         } else {
-          console.log(`Resumed existing game ${game._id} for room ${roomId}`);
+          console.log(`[JOIN] Resumed existing game ${game._id} for room ${roomId}`);
         }
 
         const chess = new Chess();
@@ -207,7 +252,7 @@ io.on('connection', (socket) => {
 
         rooms[roomId].forEach(player => {
           const opponent = rooms[roomId].find(p => p.socketId !== player.socketId);
-          console.log(`Emitting bothPlayersJoined to ${player.socketId}`);
+          console.log(`[JOIN] Emitting bothPlayersJoined to ${player.socketId}, opponent: ${opponent?.socketId}`);
           io.to(player.socketId).emit("bothPlayersJoined", {
             gameId: game._id.toString(),
             moves: game.moves,
@@ -221,7 +266,7 @@ io.on('connection', (socket) => {
         });
       }
     } catch (error) {
-      console.error("Error in joinRoom:", error);
+      console.error("[JOIN] Error in joinRoom:", error.message, error.stack);
       socket.emit("errorMessage", "An error occurred while joining the room.");
     }
   });
@@ -310,17 +355,27 @@ io.on('connection', (socket) => {
 
   socket.on("SendMove", async ({ move, gameId, userId, roomId, timeLeft }) => {
     try {
+      if (!roomId || !gameId || !userId) {
+        console.error("SendMove missing required fields:", { roomId, gameId, userId });
+        socket.emit("moveRejected", { error: "Missing required fields" });
+        return;
+      }
+
       const objectId = Types.ObjectId.isValid(gameId) ? new Types.ObjectId(gameId) : gameId;
 
       const game = await Game.findById(objectId);
-      if (!game) throw new Error("Game not found");
+      if (!game) {
+        console.error(`Game ${gameId} not found`);
+        socket.emit("moveRejected", { error: "Game not found" });
+        return;
+      }
 
       const now = Date.now();
       const elapsed = Math.floor((now - game.lastMoveTimestamp) / 1000);
 
       if (game.turn === 'white') {
         game.whiteTimeLeft -= elapsed;
-        console.log(`White time left: ${game.whiteTimeLeft}`);
+        console.log(`[MOVE] White time left: ${game.whiteTimeLeft}`);
         if (game.whiteTimeLeft <= 0) {
           game.status = 'finished';
           game.winner = game.playerBlack;
@@ -333,7 +388,6 @@ io.on('connection', (socket) => {
             winner: game.playerBlack
           });
 
-          // Send to black player → won
           io.to(game.playerBlack.toString()).emit("gameOver", {
             reason: "timeout",
             status: "won",
@@ -366,8 +420,6 @@ io.on('connection', (socket) => {
         }
       }
 
-
-
       game.turn = game.turn === 'white' ? 'black' : 'white';
       game.lastMoveTimestamp = now;
 
@@ -381,12 +433,14 @@ io.on('connection', (socket) => {
       );
 
       if (!isUserTurn) {
+        console.error(`[MOVE] Not user's turn. IsWhitesTurn: ${isWhitesTurn}, PlayerWhite: ${game.playerWhite}, PlayerBlack: ${game.playerBlack}, UserId: ${userId}`);
         socket.emit("moveRejected", { error: "Not your turn!" });
         return;
       }
 
       const result = chess.move(move);
       if (!result) {
+        console.error(`[MOVE] Illegal move: ${move}`);
         socket.emit("moveRejected", { error: "Illegal move!" });
         return;
       }
@@ -414,7 +468,7 @@ io.on('connection', (socket) => {
       }
 
       const updatedGame = await game.save();
-      socket.to(roomId).emit("receiveMove", {
+      const moveUpdate = {
         move: result,
         fen: chess.fen(),
         gameStatus: updatedGame.status,
@@ -422,10 +476,18 @@ io.on('connection', (socket) => {
         allMoves: updatedGame.moves,
         whiteTimeLeft: game.whiteTimeLeft,
         blackTimeLeft: game.blackTimeLeft
-      });
+      };
+
+      console.log(`[MOVE] User ${userId} played ${result.san} in room ${roomId}. Broadcasting update.`);
+      
+      // Send to opponent (socket.to only sends to others in room)
+      socket.to(roomId).emit("receiveMove", moveUpdate);
+      
+      // Send confirmation back to sender
+      socket.emit("moveAccepted", moveUpdate);
     } catch (err) {
-      console.error("Move error:", err.message);
-      socket.emit("moveRejected", { error: "Server error." });
+      console.error("[MOVE] Error:", err.message, err.stack);
+      socket.emit("moveRejected", { error: "Server error: " + err.message });
     }
   });
 
@@ -445,63 +507,65 @@ io.on('connection', (socket) => {
   socket.on("call-user", ({ targetSocketId, offer }) => {
     try {
       if (!targetSocketId || !offer) {
-        console.error("call-user event missing required fields");
+        console.error("[WEBRTC] call-user missing fields");
         return;
       }
-      console.log("call received on backend, forwarding to", targetSocketId);
+      console.log(`[WEBRTC] ${socket.id} sending offer to ${targetSocketId}`);
       io.to(targetSocketId).emit("incoming-call", { from: socket.id, offer });
     } catch (error) {
-      console.error("Error in call-user event:", error);
+      console.error("[WEBRTC] Error in call-user:", error);
     }
   });
 
   socket.on("answer-call", ({ targetSocketId, answer }) => {
     try {
       if (!targetSocketId || !answer) {
-        console.error("answer-call event missing required fields");
+        console.error("[WEBRTC] answer-call missing fields");
         return;
       }
-      console.log("answer received on backend, forwarding to", targetSocketId);
+      console.log(`[WEBRTC] ${socket.id} sending answer to ${targetSocketId}`);
       io.to(targetSocketId).emit("call-answered", { from: socket.id, answer });
     } catch (error) {
-      console.error("Error in answer-call event:", error);
+      console.error("[WEBRTC] Error in answer-call:", error);
     }
   });
 
   socket.on('reconnect-call', ({ targetSocketId }) => {
     try {
       if (!targetSocketId) {
-        console.error("reconnect-call event missing targetSocketId");
+        console.error("[WEBRTC] reconnect-call missing targetSocketId");
         return;
       }
+      console.log(`[WEBRTC] ${socket.id} requesting reconnect to ${targetSocketId}`);
       io.to(targetSocketId).emit('reconnect-call', { from: socket.id });
     } catch (error) {
-      console.error("Error in reconnect-call event:", error);
+      console.error("[WEBRTC] Error in reconnect-call:", error);
     }
   });
 
   socket.on("ice-candidate", ({ targetSocketId, candidate }) => {
     try {
       if (!targetSocketId || !candidate) {
-        console.error("ice-candidate event missing required fields");
+        console.error("[WEBRTC] ice-candidate missing fields");
         return;
       }
-      console.log("Ice candidate received on backend, forwarding to", targetSocketId);
+      console.log(`[WEBRTC] ${socket.id} sending ICE candidate to ${targetSocketId}`);
       io.to(targetSocketId).emit("ice-candidate", { from: socket.id, candidate });
     } catch (error) {
-      console.error("Error in ice-candidate event:", error);
+      console.error("[WEBRTC] Error in ice-candidate:", error);
     }
   });
 
   socket.on("end-call", ({ targetSocketId }) => {
     try {
       if (!targetSocketId) {
-        console.error("end-call event missing targetSocketId");
+        console.error("[WEBRTC] end-call missing targetSocketId");
         return;
       }
+      console.log(`[WEBRTC] ${socket.id} ending call with ${targetSocketId}`);
       io.to(targetSocketId).emit("call-ended", { from: socket.id });
     } catch (error) {
-      console.error("Error in end-call event:", error);
+      console.error("[WEBRTC] Error in end-call:", error);
     }
   });
 
