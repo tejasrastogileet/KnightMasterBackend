@@ -277,8 +277,9 @@ io.on('connection', (socket) => {
         console.error("Draw event missing roomId");
         return;
       }
-      console.log(`Draw offer sent in room ${roomId}`);
-      socket.to(roomId).emit("Opponent Draw");
+      console.log(`[DRAW] Draw offer sent in room ${roomId}`);
+      // ✓ FIXED: Broadcast to all in room so both see offer
+      io.to(roomId).emit("Opponent Draw");
     } catch (error) {
       console.error("Error in Draw event:", error);
     }
@@ -307,8 +308,15 @@ io.on('connection', (socket) => {
       }
 
       await game.save();
-      console.log(`User ${userId} resigned in game ${gameId}`);
-      socket.to(roomId).emit("Opponent Resign");
+      console.log(`[RESIGN] User ${userId} resigned in game ${gameId}`);
+      
+      // ✓ FIXED: Broadcast to ALL in room, not just opponent
+      // Both players need to see game over state
+      io.to(roomId).emit("gameOver", {
+        reason: "resignation",
+        winner: game.winner,
+        gameId: gameId
+      });
     } catch (error) {
       console.error("Error in Resign event:", error);
       socket.emit("errorMessage", "An error occurred while resigning.");
@@ -332,8 +340,9 @@ io.on('connection', (socket) => {
 
       game.status = "draw";
       await game.save();
-      console.log(`Draw accepted in game ${gameId}`);
-      socket.to(roomId).emit("DrawAccepted");
+      console.log(`[DRAW] Draw accepted in game ${gameId}`);
+      // ✓ FIXED: Broadcast to all in room
+      io.to(roomId).emit("DrawAccepted");
     } catch (error) {
       console.error("Error in DrawAccepted event:", error);
       socket.emit("errorMessage", "An error occurred while accepting draw.");
@@ -346,8 +355,9 @@ io.on('connection', (socket) => {
         console.error("DrawDeclined event missing roomId");
         return;
       }
-      console.log(`Draw declined in room ${roomId}`);
-      socket.to(roomId).emit("DrawDeclined");
+      console.log(`[DRAW] Draw declined in room ${roomId}`);
+      // ✓ FIXED: Broadcast to all in room
+      io.to(roomId).emit("DrawDeclined");
     } catch (error) {
       console.error("Error in DrawDeclined event:", error);
     }
@@ -382,16 +392,11 @@ io.on('connection', (socket) => {
 
           await game.save();
 
-          io.to(game.playerWhite.toString()).emit("gameOver", {
+          // ✓ FIXED: Broadcast to room, not userId (which is not a Socket.IO target)
+          io.to(roomId).emit("gameOver", {
             reason: "timeout",
-            status: "lost",
-            winner: game.playerBlack
-          });
-
-          io.to(game.playerBlack.toString()).emit("gameOver", {
-            reason: "timeout",
-            status: "won",
-            winner: game.playerBlack
+            winner: game.playerBlack,
+            gameId: gameId
           });
 
           return;
@@ -404,16 +409,11 @@ io.on('connection', (socket) => {
 
           await game.save();
 
-          io.to(game.playerBlack.toString()).emit("gameOver", {
+          // ✓ FIXED: Broadcast to room, not userId (which is not a Socket.IO target)
+          io.to(roomId).emit("gameOver", {
             reason: "timeout",
-            status: "lost",
-            winner: game.playerWhite
-          });
-
-          io.to(game.playerWhite.toString()).emit("gameOver", {
-            reason: "timeout",
-            status: "won",
-            winner: game.playerWhite
+            winner: game.playerWhite,
+            gameId: gameId
           });
 
           return;
@@ -480,11 +480,9 @@ io.on('connection', (socket) => {
 
       console.log(`[MOVE] User ${userId} played ${result.san} in room ${roomId}. Broadcasting update.`);
       
-      // Send to opponent (socket.to only sends to others in room)
-      socket.to(roomId).emit("receiveMove", moveUpdate);
-      
-      // Send confirmation back to sender
-      socket.emit("moveAccepted", moveUpdate);
+      // ✓ FIXED: Use io.to(roomId) to send to ALL players in room, not just opponent
+      // Chat works because messages go to opponent; moves MUST sync to both players
+      io.to(roomId).emit("receiveMove", moveUpdate);
     } catch (err) {
       console.error("[MOVE] Error:", err.message, err.stack);
       socket.emit("moveRejected", { error: "Server error: " + err.message });
