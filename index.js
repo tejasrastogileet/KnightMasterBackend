@@ -520,7 +520,9 @@ io.on('connection', (socket) => {
   });
 });
 
-http.listen(process.env.PORT_NO, () => {
-  console.log("Server started on port", process.env.PORT_NO);
+const PORT = process.env.PORT || process.env.PORT_NO || 3000;
+
+http.listen(PORT, () => {
+  console.log("Server started on port", PORT);
   connectDB();
 });
